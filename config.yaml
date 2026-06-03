@@ -1,0 +1,10 @@
+cat_features: [region, crop_type]
+num_features: [temperature, humidity, ph]
+embedding_dim: 64
+n_layers: 6
+n_heads: 8
+learning_rate: 0.001
+batch_size: 128
+epochs: 200
+early_stopping_patience: 20
+missing_simulation: true
