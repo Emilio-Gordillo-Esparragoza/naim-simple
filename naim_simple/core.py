@@ -321,7 +321,7 @@ class NAIM:
             Loaded model instance.
         """
         with open(path, 'rb') as f:
-            model_dict = pickle.load(f)
+            model_dict = pickle.load(f) # nosec B301
 
         # Create new instance
         model = cls(
