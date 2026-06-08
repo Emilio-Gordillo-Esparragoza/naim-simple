@@ -1,19 +1,22 @@
 """
 Test YAML configuration loading with features included.
 """
+
 from naim_simple import NAIM
 import pandas as pd
 import numpy as np
 
 # Load sample data
-df = pd.read_csv('sample_data.csv')
-X = df[['region', 'crop_type', 'temperature', 'humidity', 'ph']]
-y = df['yield']
+df = pd.read_csv("tests/sample_data.csv")
+X = df[["region", "crop_type", "temperature", "humidity", "ph"]]
+y = df["yield"]
 
 # Test from_yaml with features in config
 print("Testing from_yaml with features in config...")
-model = NAIM.from_yaml('config.yaml')
-print(f"Model created with embedding_dim={model.embedding_dim}, n_layers={model.n_layers}")
+model = NAIM.from_yaml("config.yaml")
+print(
+    f"Model created with embedding_dim={model.embedding_dim}, n_layers={model.n_layers}"
+)
 print(f"Cat features: {model.cat_features}")
 print(f"Num features: {model.num_features}")
 
