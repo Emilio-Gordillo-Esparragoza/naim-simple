@@ -4,7 +4,9 @@
 
 ### Security
 
-- Require setuptools >=83.0 and skip the unpublished local package in `pip-audit`.
+- Keep the package build backend on setuptools >=77 (Python 3.9 compatible) and
+  upgrade to setuptools >=83 only in the Python 3.10 security job so
+  `pip-audit` can resolve PYSEC-2026-3447 without breaking the 3.9 matrix.
 
 ### Changed
 

@@ -23,8 +23,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e . bandit pip-audit
-          # Force the patched setuptools after project install. Torch may request
-          # setuptools<82, but PYSEC-2026-3447 is fixed only in setuptools>=83.0.
+          # Force the patched setuptools after project install on Python 3.10+.
+          # setuptools>=83 dropped 3.9, so the package build backend stays lower.
+          # Torch may request setuptools<82, but PYSEC-2026-3447 needs >=83.0.
           python -m pip install --upgrade "setuptools>=83.0"
 
       - name: Run Bandit security scan
