@@ -1,21 +1,22 @@
 import enum
 import math
+from typing import List
+
 import torch
 from torch import Tensor, nn
 
-from typing import List
 
 class _TokenInitialization(enum.Enum):
-    UNIFORM = 'uniform'
-    NORMAL = 'normal'
+    UNIFORM = "uniform"
+    NORMAL = "normal"
 
     @classmethod
-    def from_str(cls, initialization: str) -> '_TokenInitialization':
+    def from_str(cls, initialization: str) -> "_TokenInitialization":
         try:
             return cls(initialization)
         except ValueError:
             valid_values = [x.value for x in _TokenInitialization]
-            raise ValueError(f'initialization must be one of {valid_values}')
+            raise ValueError(f"initialization must be one of {valid_values}")
 
     def apply(self, x: Tensor, d: int) -> None:
         d_sqrt_inv = 1 / math.sqrt(d)
@@ -78,17 +79,23 @@ class CategoricalFeatureTokenizer(nn.Module):
             * [gorishniy2021revisiting] Yury Gorishniy, Ivan Rubachev, Valentin Khrulkov, Artem Babenko, "Revisiting Deep Learning Models for Tabular Data", 2021
         """
         super().__init__()
-        assert cardinalities, 'cardinalities must be non-empty'
-        assert d_token > 0, 'd_token must be positive'
+        assert cardinalities, "cardinalities must be non-empty"
+        assert d_token > 0, "d_token must be positive"
         if initialization is not None:
             initialization_ = _TokenInitialization.from_str(initialization)
         else:
             initialization_ = None
 
         category_offsets = torch.tensor([0] + cardinalities[:-1]).cumsum(0)
-        self.register_buffer('category_offsets', category_offsets, persistent=False)
+        self.register_buffer("category_offsets", category_offsets, persistent=False)
         self.padding_idx = padding_idx
-        self.embeddings = nn.Embedding(sum(cardinalities), d_token, padding_idx=padding_idx, norm_type=2, max_norm=1)
+        self.embeddings = nn.Embedding(
+            sum(cardinalities),
+            d_token,
+            padding_idx=padding_idx,
+            norm_type=2,
+            max_norm=1,
+        )
         self.bias = nn.Parameter(Tensor(len(cardinalities), d_token)) if bias else None
 
         if initialization is not None:

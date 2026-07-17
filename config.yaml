@@ -1,5 +1,5 @@
-cat_features: [region, crop_type]
-num_features: [temperature, humidity, ph]
+cat_features: ["region", "crop_type"]
+num_features: ["temperature", "humidity", "ph"]
 embedding_dim: 64
 n_layers: 6
 n_heads: 8
@@ -8,3 +8,5 @@ batch_size: 128
 epochs: 200
 early_stopping_patience: 20
 missing_simulation: true
+device: auto
+random_state: 42

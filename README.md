@@ -1,141 +1,146 @@
 # NAIM Simple
-[WIP]
-A simplified scikit-learn-like wrapper for the NAIM (Not Another Imputation Method) model that hides all Hydra complexity.
+
+NAIM Simple is a work-in-progress scikit-learn-like wrapper for the
+[NAIM model](https://github.com/cosbidev/NAIM) for tabular classification with
+missing values.
 
 ## Installation
 
-```bash
-pip install naim_simple
-```
-
-Or install from source:
+NAIM Simple supports Python 3.9 through 3.11.
 
 ```bash
-git clone https://github.com/yourusername/naim_simple.git
-cd naim_simple
+git clone https://github.com/Emilio-Gordillo-Esparragoza/naim-simple.git
+cd naim-simple
 pip install -e .
 ```
 
-## Usage
+For development:
 
-### Basic Example
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## Python API
 
 ```python
-from naim_simple import NAIM
 import pandas as pd
 
-# Load your data
-train_df = pd.read_csv('train.csv')
-test_df = pd.read_csv('test.csv')
+from naim_simple import NAIM
 
-# Define feature types
-cat_features = ['region', 'crop_type']
-num_features = ['temperature', 'humidity', 'ph']
+train = pd.read_csv("train.csv")
+cat_features = ["region", "crop_type"]
+num_features = ["temperature", "humidity", "ph"]
+features = cat_features + num_features
 
-# Initialize model
 model = NAIM(
     cat_features=cat_features,
     num_features=num_features,
     embedding_dim=32,
     n_layers=4,
     n_heads=4,
-    learning_rate=1e-3,
     batch_size=128,
     epochs=200,
-    early_stopping_patience=20,
-    missing_simulation=True,
-    device='auto'
+    random_state=42,
 )
+model.fit(train[features], train["yield"])
 
-# Train model
-X_train = train_df[cat_features + num_features]
-y_train = train_df['yield']
-model.fit(X_train, y_train)
+predictions = model.predict(train[features])
+probabilities = model.predict_proba(train[features])
 
-# Make predictions
-X_test = test_df[cat_features + num_features]
-predictions = model.predict(X_test)
-probabilities = model.predict_proba(X_test)
-
-# Save and load model
-model.save('naim_model.pkl')
-loaded_model = NAIM.load('naim_model.pkl')
+# The model format is a directory containing JSON metadata and safe tensor weights.
+model.save("yield-model.naim")
+loaded = NAIM.load("yield-model.naim")
 ```
 
-### From YAML Configuration
+Categorical mappings are fitted once and stored with the model. Missing and unseen
+categorical values use the model's padding path; numerical NaNs remain NaN until
+the model constructs its attention mask. Prediction accepts feature columns in any
+order but rejects missing or unexpected columns.
 
-Create a `config.yaml` file:
+Early stopping is active only when both validation inputs are supplied:
+
+```python
+model.fit(X_train, y_train, X_val=X_valid, y_val=y_valid)
+```
+
+## YAML configuration
+
+`embedding_dim` must be divisible by `n_heads`. Unknown configuration keys are
+rejected.
 
 ```yaml
+cat_features: ["region", "crop_type"]
+num_features: ["temperature", "humidity", "ph"]
 embedding_dim: 64
 n_layers: 6
-n_heads: 6
+n_heads: 8
 learning_rate: 0.001
 batch_size: 128
 epochs: 200
 early_stopping_patience: 20
 missing_simulation: true
+device: auto
+random_state: 42
 ```
-
-Then use it:
 
 ```python
-from naim_simple import NAIM
-
-model = NAIM.from_yaml('config.yaml')
-# You still need to provide cat_features and num_features when fitting
-model.fit(X_train, y_train, cat_features=['region', 'crop_type'], 
-          num_features=['temperature', 'humidity', 'ph'])
+model = NAIM.from_yaml("config.yaml")
+model.fit(X_train, y_train)
 ```
 
-### Command-Line Interface
+## Command line
 
-Train a model:
+The installed commands invoke training and prediction directly:
 
 ```bash
-naim-train --data train.csv --target yield --cat region,crop_type --num temp,hum,ph --output model.pkl
+naim-train \
+  --data train.csv \
+  --target yield \
+  --cat region,crop_type \
+  --num temperature,humidity,ph \
+  --output yield-model.naim
+
+naim-predict \
+  --model yield-model.naim \
+  --test test.csv \
+  --out predictions.csv
 ```
 
-Make predictions:
+Use `--validation-data valid.csv` during training to activate early stopping.
+`--validation-target` defaults to the training target name. Add `--probs` during
+prediction to write one probability column per class.
 
-```bash
-naim-predict --model model.pkl --test test.csv --out predictions.csv
+## Model format and legacy pickle migration
+
+Normal `save` and `load` use a versioned directory bundle:
+
+- `manifest.json` contains validated metadata, feature mappings, and a weights checksum.
+- `weights.safetensors` contains tensors without executable pickle payloads.
+
+Do not load pickle files from untrusted sources. A model produced by version 0.1.0
+can be migrated only after verifying its origin:
+
+```python
+legacy = NAIM.load_legacy_pickle("old-model.pkl", trusted=True)
+legacy.save("migrated-model.naim")
 ```
 
-To output class probabilities instead of labels:
-
-```bash
-naim-predict --model model.pkl --test test.csv --out probabilities.csv --probs
-```
-
-## Features
-
-- Scikit-learn-like API (`fit`, `predict`, `predict_proba`)
-- Automatic handling of missing values (creates missing mask internally)
-- Support for categorical and numerical features
-- GPU acceleration when available
-- Model saving/loading with pickle
-- YAML configuration support
-- Simple CLI for training and prediction
-- Early stopping to prevent overfitting
-- Missing simulation regularization as in the original paper
+The legacy loader is deliberately separate, emits a deprecation warning, and can
+execute code embedded in a malicious pickle.
 
 ## Requirements
 
-- Python >= 3.7
-- torch >= 1.9.0
-- pandas >= 1.3.0
-- numpy >= 1.20.0
-- scikit-learn >= 0.24.0
-- pyyaml >= 5.4.0
-- click >= 8.0.0
-- pydantic >= 1.8.0
+Core dependency floors are declared in `pyproject.toml`: PyTorch 2.0, pandas 1.5,
+NumPy 1.23, scikit-learn 1.2, PyYAML 6, Click 8, Pydantic 2.5, and Safetensors
+0.4. CI tests Python 3.9, 3.10, and 3.11 independently.
+
+## Development and releases
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks. Tagged releases are built
+only after the full Python test matrix passes. User-visible changes are recorded in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-This wrapper is based on the original NAIM implementation by Cosbidev:
-https://github.com/cosbidev/NAIM
+MIT License. See [LICENSE.txt](LICENSE.txt).

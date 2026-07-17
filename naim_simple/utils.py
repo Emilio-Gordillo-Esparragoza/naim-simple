@@ -1,19 +1,32 @@
 """
 Utility functions for data conversion.
 """
-import torch
+
+from typing import Dict, List, Mapping
+
 import numpy as np
 import pandas as pd
-from typing import List, Tuple
-from sklearn.preprocessing import LabelEncoder
+import torch
+
+CategoricalEncoders = Dict[str, Dict[str, int]]
+
+
+def fit_categorical_encoders(df: pd.DataFrame, cat_features: List[str]) -> CategoricalEncoders:
+    """Fit deterministic string-to-index mappings for categorical columns."""
+    encoders: CategoricalEncoders = {}
+    for feature in cat_features:
+        values = sorted({str(value) for value in df[feature].dropna().tolist()})
+        encoders[feature] = {value: index for index, value in enumerate(values)}
+    return encoders
 
 
 def dataframe_to_tensors(
     df: pd.DataFrame,
     cat_features: List[str],
     num_features: List[str],
-    device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    device: torch.device,
+    categorical_encoders: Mapping[str, Mapping[str, int]],
+) -> torch.Tensor:
     """
     Convert pandas DataFrame to tensors with missing mask.
 
@@ -31,9 +44,7 @@ def dataframe_to_tensors(
     Returns
     -------
     tensor_data : torch.Tensor
-        Data tensor with NaN replaced by appropriate values.
-    missing_mask : torch.Tensor
-        Binary mask indicating missing values (1 = missing, 0 = present).
+        Data tensor. Missing and unknown values remain NaN so the model can mask them.
     """
     # Ensure we have all required columns
     required_cols = cat_features + num_features
@@ -44,30 +55,21 @@ def dataframe_to_tensors(
     # Select only required columns in the specified order
     df = df[required_cols].copy()
 
-    # Create missing mask (1 = missing, 0 = present) from original data
-    missing_mask = df.isna().astype(np.float32).values
-
     # Process each column
     processed_arrays = []
 
-    # Handle categorical columns
     for feat in cat_features:
-        series = df[feat].copy()
-        # Fill NaN with a special string that we'll encode as -1
-        filled = series.fillna('__NAIM_MISSING__')
-        # Use LabelEncoder to convert to integers
-        le = LabelEncoder()
-        encoded = le.fit_transform(filled.astype(str))
-        # Find the encoding for our missing placeholder and change it to -1
-        missing_encoding = np.where(le.classes_ == '__NAIM_MISSING__')[0]
-        if len(missing_encoding) > 0:
-            encoded[encoded == missing_encoding[0]] = -1
-        processed_arrays.append(encoded.reshape(-1, 1).astype(np.float32))
+        if feat not in categorical_encoders:
+            raise ValueError(f"Missing categorical encoder for feature: {feat}")
+        mapping = categorical_encoders[feat]
+        encoded = df[feat].map(
+            lambda value: np.nan if pd.isna(value) else mapping.get(str(value), np.nan)
+        )
+        processed_arrays.append(encoded.to_numpy().reshape(-1, 1).astype(np.float32))
 
-    # Handle numerical columns
     for feat in num_features:
-        series = df[feat].fillna(0)  # Fill NaN with 0
-        processed_arrays.append(series.values.reshape(-1, 1).astype(np.float32))
+        numeric = pd.to_numeric(df[feat], errors="raise")
+        processed_arrays.append(numeric.to_numpy().reshape(-1, 1).astype(np.float32))
 
     # Combine all columns horizontally
     if processed_arrays:
@@ -76,8 +78,5 @@ def dataframe_to_tensors(
         # If no features, create empty array with correct number of rows
         processed_array = np.empty((len(df), 0), dtype=np.float32)
 
-    # Convert to tensor
     tensor_data = torch.from_numpy(processed_array).to(device)
-    missing_mask = torch.from_numpy(missing_mask).to(device)
-
-    return tensor_data, missing_mask
+    return tensor_data

@@ -1,32 +1,40 @@
-"""
-Configuration schema for NAIM Simple.
-"""
+"""Validated YAML configuration for NAIM Simple."""
+
 from typing import List, Optional
-from pydantic import BaseModel, Field, validator
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class NAIMConfig(BaseModel):
-    """Configuration schema for NAIM model."""
-    embedding_dim: int = Field(32, gt=0, description="Dimension of feature embeddings")
-    n_layers: int = Field(4, gt=0, description="Number of transformer encoder layers")
-    n_heads: int = Field(4, gt=0, description="Number of attention heads")
-    learning_rate: float = Field(1e-3, gt=0, description="Learning rate for optimizer")
-    batch_size: int = Field(128, gt=0, description="Batch size for training")
-    epochs: int = Field(200, gt=0, description="Maximum number of training epochs")
-    early_stopping_patience: int = Field(20, gt=0, description="Patience for early stopping")
-    missing_simulation: bool = Field(True, description="Whether to use missing simulation regularization")
-    device: str = Field('auto', description="Device to use: 'cpu', 'cuda', or 'auto'")
-    
-    @validator('device')
-    def validate_device(cls, v):
-        allowed = ['cpu', 'cuda', 'auto']
-        if v not in allowed:
-            raise ValueError(f'device must be one of {allowed}')
-        return v
-    
-    @validator('n_heads')
-    def validate_n_heads(cls, v, values):
-        if 'embedding_dim' in values and v > 0:
-            if values['embedding_dim'] % v != 0:
-                raise ValueError(f'n_heads ({v}) must divide embedding_dim ({values["embedding_dim"]})')
-        return v
+    """Configuration schema for a NAIM classifier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cat_features: Optional[List[str]] = None
+    num_features: Optional[List[str]] = None
+    embedding_dim: int = Field(32, gt=0)
+    n_layers: int = Field(4, gt=0)
+    n_heads: int = Field(4, gt=0)
+    learning_rate: float = Field(1e-3, gt=0)
+    batch_size: int = Field(128, gt=0)
+    epochs: int = Field(200, gt=0)
+    early_stopping_patience: int = Field(20, gt=0)
+    missing_simulation: bool = True
+    device: str = "auto"
+    random_state: Optional[int] = None
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        allowed = {"cpu", "cuda", "auto"}
+        if value not in allowed:
+            raise ValueError(f"device must be one of {sorted(allowed)}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_attention_shape(self) -> "NAIMConfig":
+        if self.embedding_dim % self.n_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must divide embedding_dim " f"({self.embedding_dim})"
+            )
+        return self

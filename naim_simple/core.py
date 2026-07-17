@@ -1,45 +1,37 @@
-"""
-Main NAIM wrapper class with scikit-learn-like API.
-"""
-import pickle
-import torch
+"""Scikit-learn-like wrapper around the NAIM PyTorch model."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import warnings
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
 import pandas as pd
-from typing import List, Optional, Union
+import torch
+from safetensors.torch import load_file, save_file
+from torch.utils.data import DataLoader, TensorDataset
+
 from ._compat import NAIM as _NAIM
-from .utils import dataframe_to_tensors
+from .utils import (
+    CategoricalEncoders,
+    dataframe_to_tensors,
+    fit_categorical_encoders,
+)
 
 
 class NAIM:
-    """
-    NAIM (Not Another Imputation Method) wrapper for classification tasks.
-    Provides a scikit-learn-like interface while hiding Hydra complexity.
+    """NAIM classifier with a small, explicit training and persistence API."""
 
-    Parameters
-    ----------
-    cat_features : list of str, optional
-        Names of categorical columns.
-    num_features : list of str, optional
-        Names of numerical columns.
-    embedding_dim : int, default=32
-        Dimension of feature embeddings.
-    n_layers : int, default=4
-        Number of transformer encoder layers.
-    n_heads : int, default=4
-        Number of attention heads.
-    learning_rate : float, default=1e-3
-        Learning rate for optimizer.
-    batch_size : int, default=128
-        Batch size for training.
-    epochs : int, default=200
-        Maximum number of training epochs.
-    early_stopping_patience : int, default=20
-        Patience for early stopping.
-    missing_simulation : bool, default=True
-        Whether to use missing simulation regularization.
-    device : str, default='auto'
-        Device to use: 'cpu', 'cuda', or 'auto'.
-    """
+    SCHEMA_VERSION = 1
+    MANIFEST_NAME = "manifest.json"
+    WEIGHTS_NAME = "weights.safetensors"
+
     def __init__(
         self,
         cat_features: Optional[List[str]] = None,
@@ -52,10 +44,11 @@ class NAIM:
         epochs: int = 200,
         early_stopping_patience: int = 20,
         missing_simulation: bool = True,
-        device: str = 'auto'
+        device: str = "auto",
+        random_state: Optional[int] = None,
     ):
-        self.cat_features = cat_features
-        self.num_features = num_features
+        self.cat_features = list(cat_features) if cat_features is not None else None
+        self.num_features = list(num_features) if num_features is not None else None
         self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -65,339 +58,371 @@ class NAIM:
         self.early_stopping_patience = early_stopping_patience
         self.missing_simulation = missing_simulation
         self.device = device
+        self.random_state = random_state
+        self._validate_parameters()
 
-        # Will be set during fit
-        self.model_ = None
-        self.feature_names_ = None
-        self.cat_idxs_ = None
-        self.cat_dims_ = None
-        self.classes_ = None
-        self.class_to_idx_ = None
-        self.idx_to_class_ = None
+        self.model_: Optional[_NAIM] = None
+        self.feature_names_: Optional[List[str]] = None
+        self.cat_idxs_: Optional[List[int]] = None
+        self.cat_dims_: Optional[List[int]] = None
+        self.categorical_encoders_: CategoricalEncoders = {}
+        self.classes_: Optional[np.ndarray] = None
+        self.class_to_idx_: Optional[Dict[Any, int]] = None
+        self.idx_to_class_: Optional[Dict[int, Any]] = None
+        self.best_model_state_: Optional[Dict[str, torch.Tensor]] = None
+        self._legacy_dynamic_encoding = False
 
-    def _get_device(self):
-        """Get actual device based on availability."""
-        if self.device == 'auto':
-            return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def _validate_parameters(self) -> None:
+        positive_ints = {
+            "embedding_dim": self.embedding_dim,
+            "n_layers": self.n_layers,
+            "n_heads": self.n_heads,
+            "batch_size": self.batch_size,
+            "epochs": self.epochs,
+            "early_stopping_patience": self.early_stopping_patience,
+        }
+        for name, value in positive_ints.items():
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.embedding_dim % self.n_heads != 0:
+            raise ValueError("n_heads must divide embedding_dim")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device must be one of: auto, cpu, cuda")
+
+    def _get_device(self) -> torch.device:
+        if self.device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available")
         return torch.device(self.device)
+
+    def _validate_features(self, X: pd.DataFrame) -> None:
+        if self.cat_features is None or self.num_features is None:
+            raise ValueError("cat_features and num_features must be set before fitting")
+        configured = self.cat_features + self.num_features
+        if len(configured) != len(set(configured)):
+            raise ValueError("Feature names must be unique across cat_features and num_features")
+        missing = set(configured) - set(X.columns)
+        extra = set(X.columns) - set(configured)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing columns: {sorted(missing)}")
+            if extra:
+                details.append(f"unexpected columns: {sorted(extra)}")
+            raise ValueError("; ".join(details))
+
+    def _transform(self, X: pd.DataFrame) -> torch.Tensor:
+        self._validate_features(X)
+        encoders = self.categorical_encoders_
+        if self._legacy_dynamic_encoding:
+            encoders = fit_categorical_encoders(X, self.cat_features or [])
+        return dataframe_to_tensors(
+            X,
+            self.cat_features or [],
+            self.num_features or [],
+            self._get_device(),
+            encoders,
+        )
+
+    def _new_model(self) -> _NAIM:
+        if self.feature_names_ is None or self.classes_ is None:
+            raise RuntimeError("Model metadata is incomplete")
+        return _NAIM(
+            input_size=len(self.feature_names_),
+            output_size=len(self.classes_),
+            cat_idxs=self.cat_idxs_ or [],
+            cat_dims=self.cat_dims_ or [],
+            d_token=self.embedding_dim,
+            embedder_initialization="uniform",
+            bias=False,
+            mask_type=0 if self.missing_simulation else 2,
+            missing_value="-inf",
+            num_heads=self.n_heads,
+            feedforward_dim=1000,
+            dropout_rate=0.1,
+            activation="relu",
+            num_layers=self.n_layers,
+            extractor=False,
+        ).to(self._get_device())
 
     def fit(
         self,
         X: pd.DataFrame,
         y: Union[pd.Series, np.ndarray, list],
         X_val: Optional[pd.DataFrame] = None,
-        y_val: Optional[Union[pd.Series, np.ndarray, list]] = None
-    ) -> 'NAIM':
-        """
-        Fit the NAIM model.
+        y_val: Optional[Union[pd.Series, np.ndarray, list]] = None,
+    ) -> "NAIM":
+        """Fit the classifier."""
+        self._validate_features(X)
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must be provided together")
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of rows")
+        if len(X) == 0:
+            raise ValueError("Training data must contain at least one row")
 
-        Parameters
-        ----------
-        X : pandas DataFrame
-            Training data with NaN values.
-        y : array-like
-            Target values.
-        X_val : pandas DataFrame, optional
-            Validation data.
-        y_val : array-like, optional
-            Validation targets.
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+            torch.manual_seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.random_state)
 
-        Returns
-        -------
-        self : object
-            Returns self.
-        """
-        if self.cat_features is None or self.num_features is None:
-            raise ValueError("cat_features and num_features must be set before calling fit")
+        self.feature_names_ = (self.cat_features or []) + (self.num_features or [])
+        self.cat_idxs_ = list(range(len(self.cat_features or [])))
+        self.categorical_encoders_ = fit_categorical_encoders(X, self.cat_features or [])
+        self.cat_dims_ = [
+            len(self.categorical_encoders_[feature]) for feature in self.cat_features or []
+        ]
 
-        # Store feature information
-        self.feature_names_ = list(X.columns)
-        self.cat_idxs_ = [self.feature_names_.index(f) for f in self.cat_features]
-        # For numerical features, we don't need cardinalities in the same way
-        # We'll determine categorical dimensions from data
-        self.cat_dims_ = [int(X[f].nunique()) for f in self.cat_features]
+        target = np.asarray(y)
+        self.classes_ = np.unique(target)
+        self.class_to_idx_ = {value: index for index, value in enumerate(self.classes_)}
+        self.idx_to_class_ = {index: value for value, index in self.class_to_idx_.items()}
+        y_mapped = np.array([self.class_to_idx_[value] for value in target])
 
-        # Convert targets to numpy array
-        if isinstance(y, pd.Series):
-            y = y.values
-        elif isinstance(y, list):
-            y = np.array(y)
-        self.classes_ = np.unique(y)
-        # Map target values to indices for classification
-        self.class_to_idx_ = {cls: idx for idx, cls in enumerate(self.classes_)}
-        self.idx_to_class_ = {idx: cls for idx, cls in enumerate(self.classes_)}
-        y_mapped = np.array([self.class_to_idx_[val] for val in y])
-        num_classes = len(self.classes_)
-
-        # Convert data to tensors
-        train_tensors = dataframe_to_tensors(
-            X, self.cat_features, self.num_features, self._get_device()
-        )
-        X_tensor, missing_mask = train_tensors
-
-        if X_val is not None:
-            val_tensors = dataframe_to_tensors(
-                X_val, self.cat_features, self.num_features, self._get_device()
-            )
-            X_val_tensor, missing_mask_val = val_tensors
-            if isinstance(y_val, pd.Series):
-                y_val = y_val.values
-            elif isinstance(y_val, list):
-                y_val = np.array(y_val)
-            # Map validation target values to indices
-            y_val_mapped = np.array([self.class_to_idx_[val] for val in y_val])
-            y_val_tensor = torch.tensor(y_val_mapped, dtype=torch.long, device=self._get_device())
-        else:
-            X_val_tensor, missing_mask_val, y_val_tensor = None, None, None
-
+        X_tensor = self._transform(X)
         y_tensor = torch.tensor(y_mapped, dtype=torch.long, device=self._get_device())
+        dataset = TensorDataset(X_tensor, y_tensor)
+        generator = torch.Generator()
+        if self.random_state is not None:
+            generator.manual_seed(self.random_state)
+        loader = DataLoader(
+            dataset,
+            batch_size=min(self.batch_size, len(dataset)),
+            shuffle=True,
+            generator=generator,
+        )
 
-        # Initialize the underlying NAIM model
-        input_size = len(self.feature_names_)
-        self.model_ = _NAIM(
-            input_size=input_size,
-            output_size=num_classes,
-            cat_idxs=self.cat_idxs_,
-            cat_dims=self.cat_dims_,
-            d_token=self.embedding_dim,
-            embedder_initialization='uniform',
-            bias=False,
-            mask_type=0 if self.missing_simulation else 2,  # 0 for missing simulation, 2 for no masking
-            missing_value='-inf',
-            num_heads=self.n_heads,
-            feedforward_dim=1000,  # Default from original implementation
-            dropout_rate=0.1,
-            activation='relu',
-            num_layers=self.n_layers,
-            extractor=False
-        ).to(self._get_device())
+        X_val_tensor = None
+        y_val_tensor = None
+        if X_val is not None and y_val is not None:
+            self._validate_features(X_val)
+            unknown_labels = set(np.asarray(y_val)) - set(self.classes_)
+            if unknown_labels:
+                raise ValueError(f"Validation data contains unknown labels: {unknown_labels}")
+            X_val_tensor = self._transform(X_val)
+            y_val_mapped = [self.class_to_idx_[value] for value in np.asarray(y_val)]
+            y_val_tensor = torch.tensor(y_val_mapped, dtype=torch.long, device=self._get_device())
 
-        # Training loop (simplified version - in practice we'd use the original training utilities)
-        # For now, we'll implement a basic training loop
+        self.model_ = self._new_model()
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
-
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
         patience_counter = 0
+        self.best_model_state_ = None
 
-        for epoch in range(self.epochs):
+        for _ in range(self.epochs):
             self.model_.train()
-            optimizer.zero_grad()
-            logits = self.model_(X_tensor)
-            loss = criterion(logits, y_tensor)
-            loss.backward()
-            optimizer.step()
+            for X_batch, y_batch in loader:
+                optimizer.zero_grad()
+                loss = criterion(self.model_(X_batch), y_batch)
+                loss.backward()
+                optimizer.step()
 
-            # Validation
-            if X_val_tensor is not None:
+            if X_val_tensor is not None and y_val_tensor is not None:
                 self.model_.eval()
                 with torch.no_grad():
-                    val_logits = self.model_(X_val_tensor)
-                    val_loss = criterion(val_logits, y_val_tensor)
-                    
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        patience_counter = 0
-                        # Save best model state
-                        self.best_model_state_ = self.model_.state_dict().copy()
-                    else:
-                        patience_counter += 1
+                    val_loss = criterion(self.model_(X_val_tensor), y_val_tensor).item()
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    self.best_model_state_ = copy.deepcopy(self.model_.state_dict())
+                else:
+                    patience_counter += 1
+                if patience_counter >= self.early_stopping_patience:
+                    break
 
-                    if patience_counter >= self.early_stopping_patience:
-                        print(f"Early stopping at epoch {epoch}")
-                        break
-
-            if epoch % 20 == 0:
-                print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
-
-        # Load best model if validation was used
-        if hasattr(self, 'best_model_state_'):
+        if self.best_model_state_ is not None:
             self.model_.load_state_dict(self.best_model_state_)
-
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Predict class labels.
-
-        Parameters
-        ----------
-        X : pandas DataFrame
-            Input data.
-
-        Returns
-        -------
-        preds : numpy array
-            Predicted class labels.
-        """
-        if self.model_ is None:
+        """Predict class labels."""
+        if self.model_ is None or self.idx_to_class_ is None:
             raise RuntimeError("Model must be fitted before calling predict")
         self.model_.eval()
-        tensors = dataframe_to_tensors(X, self.cat_features, self.num_features, self._get_device())
-        X_tensor, _ = tensors
-
         with torch.no_grad():
-            logits = self.model_(X_tensor)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-
-        # Map back to original class labels
-        return np.array([self.idx_to_class_[int(p)] for p in preds])
+            predictions = torch.argmax(self.model_(self._transform(X)), dim=1).cpu().numpy()
+        return np.array([self.idx_to_class_[int(index)] for index in predictions])
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Predict class probabilities.
-
-        Parameters
-        ----------
-        X : pandas DataFrame
-            Input data.
-
-        Returns
-        -------
-        probs : numpy array
-            Predicted class probabilities.
-        """
+        """Predict class probabilities."""
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before calling predict_proba")
         self.model_.eval()
-        tensors = dataframe_to_tensors(X, self.cat_features, self.num_features, self._get_device())
-        X_tensor, _ = tensors
-
         with torch.no_grad():
-            logits = self.model_(X_tensor)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            logits = self.model_(self._transform(X))
+            return torch.softmax(logits, dim=1).cpu().numpy()
 
-        return probs
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(f"Class label {value!r} is not JSON serializable")
 
-    def save(self, path: str) -> None:
-        """
-        Save the model to a file.
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
-        Parameters
-        ----------
-        path : str
-            File path to save the model.
-        """
-        if self.model_ is None:
+    @staticmethod
+    def _package_version() -> str:
+        try:
+            return version("naim-simple")
+        except PackageNotFoundError:
+            return "0.1.0"
+
+    def save(self, path: Union[str, os.PathLike[str]]) -> None:
+        """Save a model as a safe, versioned directory bundle."""
+        if self.model_ is None or self.classes_ is None:
             raise RuntimeError("Model must be fitted before saving")
-        model_dict = {
-            'model_state': self.model_.state_dict(),
-            'config': {
-                'cat_features': self.cat_features,
-                'num_features': self.num_features,
-                'embedding_dim': self.embedding_dim,
-                'n_layers': self.n_layers,
-                'n_heads': self.n_heads,
-                'learning_rate': self.learning_rate,
-                'batch_size': self.batch_size,
-                'epochs': self.epochs,
-                'early_stopping_patience': self.early_stopping_patience,
-                'missing_simulation': self.missing_simulation,
-                'device': str(self.device)
-            },
-            'feature_names': self.feature_names_,
-            'cat_idxs': self.cat_idxs_,
-            'cat_dims': self.cat_dims_,
-            'classes': self.classes_,
-            'class_to_idx': self.class_to_idx_,
-            'idx_to_class': self.idx_to_class_
+        destination = Path(path)
+        if destination.exists() and not destination.is_dir():
+            raise ValueError("Model path must be a directory, not an existing file")
+        destination.mkdir(parents=True, exist_ok=True)
+
+        weights_path = destination / self.WEIGHTS_NAME
+        temporary_weights = destination / f".{self.WEIGHTS_NAME}.tmp"
+        state = {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in self.model_.state_dict().items()
         }
-        with open(path, 'wb') as f:
-            pickle.dump(model_dict, f)
+        save_file(state, temporary_weights)
+        os.replace(temporary_weights, weights_path)
+
+        manifest = {
+            "schema_version": self.SCHEMA_VERSION,
+            "naim_simple_version": self._package_version(),
+            "weights_file": self.WEIGHTS_NAME,
+            "weights_sha256": self._sha256(weights_path),
+            "config": {
+                "cat_features": self.cat_features,
+                "num_features": self.num_features,
+                "embedding_dim": self.embedding_dim,
+                "n_layers": self.n_layers,
+                "n_heads": self.n_heads,
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+                "epochs": self.epochs,
+                "early_stopping_patience": self.early_stopping_patience,
+                "missing_simulation": self.missing_simulation,
+                "device": "auto",
+                "random_state": self.random_state,
+            },
+            "feature_names": self.feature_names_,
+            "cat_idxs": self.cat_idxs_,
+            "cat_dims": self.cat_dims_,
+            "categorical_encoders": self.categorical_encoders_,
+            "classes": [self._json_value(value) for value in self.classes_],
+        }
+        manifest_path = destination / self.MANIFEST_NAME
+        temporary_manifest = destination / f".{self.MANIFEST_NAME}.tmp"
+        temporary_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temporary_manifest, manifest_path)
 
     @classmethod
-    def load(cls, path: str) -> 'NAIM':
-        """
-        Load a model from a file.
+    def load(
+        cls,
+        path: Union[str, os.PathLike[str]],
+        device: str = "auto",
+    ) -> "NAIM":
+        """Load a model from a safe directory bundle."""
+        source = Path(path)
+        manifest_path = source / cls.MANIFEST_NAME
+        if not manifest_path.is_file():
+            raise ValueError(f"Missing model manifest: {manifest_path}")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Model manifest is unreadable or invalid") from exc
+        if manifest.get("schema_version") != cls.SCHEMA_VERSION:
+            raise ValueError(f"Unsupported model schema version: {manifest.get('schema_version')}")
 
-        Parameters
-        ----------
-        path : str
-            File path to load the model from.
+        if manifest.get("weights_file") != cls.WEIGHTS_NAME:
+            raise ValueError("Model manifest references an unsupported weights file")
+        weights_path = source / cls.WEIGHTS_NAME
+        if not weights_path.is_file():
+            raise ValueError(f"Missing model weights: {weights_path}")
+        if cls._sha256(weights_path) != manifest.get("weights_sha256"):
+            raise ValueError("Model weights checksum does not match the manifest")
 
-        Returns
-        -------
-        model : NAIM
-            Loaded model instance.
-        """
-        with open(path, 'rb') as f:
-            model_dict = pickle.load(f) # nosec B301
-
-        # Create new instance
-        model = cls(
-            cat_features=model_dict['config']['cat_features'],
-            num_features=model_dict['config']['num_features'],
-            embedding_dim=model_dict['config']['embedding_dim'],
-            n_layers=model_dict['config']['n_layers'],
-            n_heads=model_dict['config']['n_heads'],
-            learning_rate=model_dict['config']['learning_rate'],
-            batch_size=model_dict['config']['batch_size'],
-            epochs=model_dict['config']['epochs'],
-            early_stopping_patience=model_dict['config']['early_stopping_patience'],
-            missing_simulation=model_dict['config']['missing_simulation'],
-            device=model_dict['config']['device']
-        )
-
-        # Restore attributes
-        model.feature_names_ = model_dict['feature_names']
-        model.cat_idxs_ = model_dict['cat_idxs']
-        model.cat_dims_ = model_dict['cat_dims']
-        model.classes_ = model_dict['classes']
-        model.class_to_idx_ = model_dict['class_to_idx']
-        model.idx_to_class_ = model_dict['idx_to_class']
-
-        # Initialize and load model state
-        input_size = len(model.feature_names_)
-        num_classes = len(model.classes_)
-        model.model_ = _NAIM(
-            input_size=input_size,
-            output_size=num_classes,
-            cat_idxs=model.cat_idxs_,
-            cat_dims=model.cat_dims_,
-            d_token=model.embedding_dim,
-            embedder_initialization='uniform',
-            bias=False,
-            mask_type=0 if model.missing_simulation else 2,
-            missing_value='-inf',
-            num_heads=model.n_heads,
-            feedforward_dim=1000,
-            dropout_rate=0.1,
-            activation='relu',
-            num_layers=model.n_layers,
-            extractor=False
-        ).to(model._get_device())
-        model.model_.load_state_dict(model_dict['model_state'])
-
+        config = dict(manifest["config"])
+        config["device"] = device
+        model = cls(**config)
+        model.feature_names_ = list(manifest["feature_names"])
+        model.cat_idxs_ = list(manifest["cat_idxs"])
+        model.cat_dims_ = list(manifest["cat_dims"])
+        model.categorical_encoders_ = {
+            feature: {value: int(index) for value, index in mapping.items()}
+            for feature, mapping in manifest["categorical_encoders"].items()
+        }
+        model.classes_ = np.asarray(manifest["classes"])
+        model.class_to_idx_ = {value: index for index, value in enumerate(model.classes_)}
+        model.idx_to_class_ = {index: value for value, index in model.class_to_idx_.items()}
+        model.model_ = model._new_model()
+        model.model_.load_state_dict(load_file(weights_path, device=str(model._get_device())))
         return model
 
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> 'NAIM':
-        """
-        Create a NAIM instance from a YAML configuration file.
+    def load_legacy_pickle(
+        cls,
+        path: Union[str, os.PathLike[str]],
+        *,
+        trusted: bool = False,
+        device: str = "auto",
+    ) -> "NAIM":
+        """Load the old pickle format only after an explicit trust decision."""
+        if not trusted:
+            raise ValueError(
+                "Legacy pickle loading can execute arbitrary code; pass trusted=True "
+                "only for an artifact you created and control"
+            )
+        warnings.warn(
+            "Legacy pickle models are unsafe and deprecated; save the loaded model "
+            "immediately in the new directory format.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Isolated behind the explicit trusted=True guard for legacy migration.
+        import pickle  # nosec B403
 
-        Parameters
-        ----------
-        yaml_path : str
-            Path to YAML configuration file.
+        with Path(path).open("rb") as stream:
+            # The caller has explicitly asserted that this legacy artifact is trusted.
+            payload = pickle.load(stream)  # nosec B301
+        config = dict(payload["config"])
+        config["device"] = device
+        model = cls(**config)
+        model.feature_names_ = list(payload["feature_names"])
+        model.cat_idxs_ = list(payload["cat_idxs"])
+        model.cat_dims_ = list(payload["cat_dims"])
+        model.classes_ = np.asarray(payload["classes"])
+        model.class_to_idx_ = {value: index for index, value in enumerate(model.classes_)}
+        model.idx_to_class_ = {index: value for value, index in model.class_to_idx_.items()}
+        model._legacy_dynamic_encoding = True
+        model.model_ = model._new_model()
+        model.model_.load_state_dict(payload["model_state"])
+        return model
 
-        Returns
-        -------
-        model : NAIM
-            Configured NAIM instance (cat_features and num_features must be set before fitting).
-        """
+    @classmethod
+    def from_yaml(cls, yaml_path: Union[str, os.PathLike[str]]) -> "NAIM":
+        """Create a validated model instance from YAML."""
         import yaml
-        with open(yaml_path, 'r') as f:
-            config = yaml.safe_load(f)
 
-        # Extract cat_features and num_features from config if present
-        cat_features = config.pop('cat_features', None)
-        num_features = config.pop('num_features', None)
-        # Create instance with remaining config
-        instance = cls(**config)
-        # Set cat_features and num_features if they were in the YAML
-        if cat_features is not None:
-            instance.cat_features = cat_features
-        if num_features is not None:
-            instance.num_features = num_features
+        from .config_schema import NAIMConfig
 
-        return instance
+        with Path(yaml_path).open("r", encoding="utf-8") as stream:
+            raw_config = yaml.safe_load(stream)
+        if not isinstance(raw_config, dict):
+            raise ValueError("YAML configuration must contain a mapping")
+        config = NAIMConfig.model_validate(raw_config)
+        return cls(**config.model_dump())
