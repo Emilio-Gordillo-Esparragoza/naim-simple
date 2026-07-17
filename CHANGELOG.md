@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Security
+
+- Require setuptools >=83.0 and skip the unpublished local package in `pip-audit`.
+
 ### Changed
 
 - Added independent Python 3.9, 3.10, and 3.11 CI jobs and real pytest coverage.
